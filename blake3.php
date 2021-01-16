@@ -1,0 +1,484 @@
+<?
+/*
+PHP implementation of BLAKE3
+
+https://github.com/BLAKE3-team/BLAKE3-specs/blob/master/blake3.pdf
+
+https://github.com/BLAKE3-team/BLAKE3
+
+It supports HASH, KEYED and DERIVE modes with XOF output
+
+There is a python version https://github.com/oconnor663/bao
+
+which is 2.5x slower than this implementation in generating the hash
+
+This implementation have been checked with the test vectors provided
+
+https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/master/test_vectors/test_vectors.json
+
+By default, XOF output are 32 bytes
+
+Examples of use:
+
+HASH MODE
+		$b2 = new BLAKE3();		
+		$hash = $b2->hash($h,$xof_length);
+
+KEYED HASH		
+						
+		$b2 = new BLAKE3($key);		
+		$keyed_hash = $b2->hash($h,$xof_length);
+
+DERIVE KEY
+		$b2 = new BLAKE3();		
+		$derive_key = $b2->derivekey($context_key,$context,$xof_length);
+		
+
+@denobisipsis 2021	   
+*/		
+class BLAKE3
+	{  	                        
+	const MSG_SCHEDULE = [
+	[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+	[2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+	[3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+	[10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+	[12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+	[9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+	[11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+	];
+
+	const IV = [
+	0x6a09e667, 0xbb67ae85,
+	0x3c6ef372, 0xa54ff53a,
+	0x510e527f, 0x9b05688c,
+	0x1f83d9ab, 0x5be0cd19
+	];
+		
+	const BLOCK_SIZE 	= 64;
+	const HEX_BLOCK_SIZE	= 128;
+	const CHUNK_SIZE 	= 1024;
+	const KEY_SIZE 		= 32;
+	const HASH_SIZE 	= 32;
+	const PARENT_SIZE 	= 2 * 32;
+	const WORD_BITS 	= 32;
+	const WORD_BYTES 	= 4;
+	const WORD_MAX 		= 2**32 - 1;
+	const HEADER_SIZE 	= 8;
+	
+	# domain flags
+	const CHUNK_START 		= 1 << 0;
+	const CHUNK_END 		= 1 << 1;
+	const ROOT 			= 1 << 3;
+	const PARENT 			= 1 << 2;
+	const KEYED_HASH 		= 1 << 4;
+	const DERIVE_KEY 		= 1 << 5;
+	const DERIVE_KEY_MATERIAL 	= 1 << 6;
+	
+	const PACKING = "V*";
+				
+	function __construct($key="")
+		{  						
+		$this->cv    = [];
+		$this->state = [];
+		$this->key   = "";
+		$this->flag			= 0;
+		$this->flagkey    		= false;
+		$this->derive_key 		= false;
+		$this->derive_key_material 	= false;
+		
+		if ($key)
+			{
+			$key  = substr($key,0,self::BLOCK_SIZE);
+			$size = strlen($key);
+			
+			if ($size<self::BLOCK_SIZE)
+			$key .= str_repeat("\x0",self::BLOCK_SIZE-strlen($key));
+									
+			$key  = array_values(unpack(self::PACKING,$key));
+			for ($i=0;$i<8;$i++)
+				$this->cv[$i]     = $key[$i];
+			$this->flagkey = true;					
+			}
+		else 
+			for ($i=0;$i<8;$i++)
+				$this->cv[$i]     = self::IV[$i];		
+		}
+		
+	function derivekey($context_key="",$context="",$xof_length)
+		{		
+		for ($k=0;$k<8;$k++) 
+			  $this->state[$k] = self::IV[$k];
+		
+		$size		 = strlen($context);	
+		if ($size<self::BLOCK_SIZE)										
+			$context.= str_repeat("\0",self::BLOCK_SIZE-$size);
+
+		$context_words = array_values(unpack(self::PACKING,$context));								
+		self::chacha($context_words,0,$size,43);	
+
+		for ($i=0;$i<8;$i++)
+			$this->cv[$i] = $this->state[$i];
+		
+		$this->derive_key_material = true;
+		
+		$derive_key       = self::hash($context_key,$xof_length);		
+		$derive_key_words = array_values(unpack(self::PACKING,$derive_key));			
+
+		for ($i=0;$i<8;$i++)
+			$this->cv[$i] = $derive_key_words[$i];				
+				
+		return $derive_key;		
+		}
+			
+    	function Right_Roll($a, $n)
+		{
+	        $lp   = ($a >> $n)           	      & self::WORD_MAX;
+	        $rp   = ($a << (self::WORD_BITS- $n)) & self::WORD_MAX;
+		   
+	        return ($lp & ((1 << (self::WORD_BITS - $n)) - 1))| $rp;	   	
+		}
+			
+	function G(&$v, $a, $b, $c, $d,$m1,$m2)
+		{
+		$f = $v[$a];
+		$g = $v[$b];
+		$h = $v[$c];
+		$i = $v[$d];
+		
+		$f += $g + $m1; 
+		$i  = self::Right_Roll($i^$f,16);   
+		$h += $i; 
+		$g  = self::Right_Roll($g^$h,12);
+		
+		$f += $g + $m2; 
+		$i  = self::Right_Roll($i^$f,8);
+		$h += $i; 
+		$g  = self::Right_Roll($g^$h,7);
+
+		$v[$a] = $f & self::WORD_MAX;
+		$v[$b] = $g & self::WORD_MAX;
+		$v[$c] = $h & self::WORD_MAX;
+		$v[$d] = $i & self::WORD_MAX;
+		}
+	
+	function chacha($chunk_words,$counter,$size,$flag,$is_xof=false,$block_over=false)
+		{
+		$v = $this->state;
+		
+		for ($k=0;$k<4;$k++) $v[$k+8] = self::IV[$k];
+		
+		$v[12]   = $counter & self::WORD_MAX;
+		$v[13]   = ($counter >> self::WORD_BITS) & self::WORD_MAX;
+		$v[14]   = $size;
+		$v[15]   = $flag;
+				
+		for ($r=0;$r<7;$r++)
+			{
+			$sr = self::MSG_SCHEDULE[$r];
+			
+			self::G($v,  0,  4,  8, 12, $chunk_words[$sr[0]], $chunk_words[$sr[1]]);
+			self::G($v,  1,  5,  9, 13, $chunk_words[$sr[2]], $chunk_words[$sr[3]]);
+			self::G($v,  2,  6, 10, 14, $chunk_words[$sr[4]], $chunk_words[$sr[5]]);
+			self::G($v,  3,  7, 11, 15, $chunk_words[$sr[6]], $chunk_words[$sr[7]]);
+			self::G($v,  0,  5, 10, 15, $chunk_words[$sr[8]], $chunk_words[$sr[9]]);
+			self::G($v,  1,  6, 11, 12, $chunk_words[$sr[10]],$chunk_words[$sr[11]]);
+			self::G($v,  2,  7,  8, 13, $chunk_words[$sr[12]],$chunk_words[$sr[13]]);
+			self::G($v,  3,  4,  9, 14, $chunk_words[$sr[14]],$chunk_words[$sr[15]]);		
+			}
+						 		
+		for ($i=0;$i<8;$i++)			 
+			 $v[$i] ^= $v[$i+8];
+	
+		if ($is_xof)			
+			for ($i=0;$i<8;$i++)
+				 {
+				 $v[$i+8] ^= $this->cv[$i];
+				 if (!$block_over)
+				 	$this->cv[$i] = $v[$i];				 
+				 }
+		$this->state = $v;				
+		}
+		
+	function genhex($v, $begin = 0, $end = 8)
+		{
+		$z="";
+		for ($k=$begin;$k<$end;$k++)
+			$z .= pack(self::PACKING,$v[$k]);
+							
+		return bin2hex($z);		
+		}
+
+	function setflags($start = self::START)
+		{
+		$this->flag = $start;
+		
+		if ($this->flagkey)	
+			$this->flag   |= self::KEYED_HASH;
+
+		if ($this->derive_key)				
+			$this->flag   |= self::DERIVE_KEY;
+			
+		if ($this->derive_key_material)
+			$this->flag   |= self::DERIVE_KEY_MATERIAL;					
+		}
+							        
+	function nodebytes($block, $is_root = false, $is_chunk = true, $is_tree = false, $is_xof = false, $block_over=false)
+		{  
+		$hashes 	= [];  	
+		$counter	= 0; 	
+		$chunks 	= str_split($block,self::CHUNK_SIZE);
+							 				
+		foreach ($chunks as $chunk)
+			{	
+			for ($k=0;$k<8;$k++) 
+				$this->state[$k] = $this->cv[$k];	
+									 			
+			$is_last = true;
+			$size    = self::BLOCK_SIZE;
+			
+			if (strlen($chunk) > self::BLOCK_SIZE)
+				{			
+				if (strlen($chunk) < self::CHUNK_SIZE) 
+					{									
+					$size = strlen($chunk) % self::BLOCK_SIZE;
+	
+					if ($size == 0) 
+						$size = self::BLOCK_SIZE;		
+							        
+					$npad	 = ceil(strlen($chunk)/self::BLOCK_SIZE) * self::BLOCK_SIZE;
+					$chunk  .= str_repeat("\x0",$npad-strlen($chunk));
+					}
+				
+				$chunk_words = array_chunk(array_values(unpack(self::PACKING,$chunk)),16);
+				
+				self::setflags(self::CHUNK_START);				
+				self::chacha($chunk_words[0],$counter,self::BLOCK_SIZE,$this->flag,$is_xof,$block_over);	
+				self::setflags(0);
+					
+				for ($k=1;$k<sizeof($chunk_words)-1;$k++)								
+					self::chacha($chunk_words[$k],$counter,self::BLOCK_SIZE,$this->flag,$is_xof,$block_over);	
+											
+				if ($is_root) 
+					 {
+					 self::setflags(self::CHUNK_END|self::ROOT); 
+					 $counter = 0;
+					 }
+				else     self::setflags(self::CHUNK_END);
+				
+				$chunk_words = $chunk_words[$k];
+				}
+			else    
+				{
+				$size    	 = strlen($chunk);
+				$chunk  	.= str_repeat("\x0",self::BLOCK_SIZE-strlen($chunk));
+				$chunk_words     = array_values(unpack(self::PACKING,$chunk));
+								
+				if ($is_chunk)
+					$flag    = self::CHUNK_START | self::CHUNK_END;			
+				else    $flag    = self::PARENT;
+				
+				if ($is_root)
+					{
+					$flag   |= self::ROOT;
+					$counter = 0;
+					}
+				
+				if ($is_tree and $is_root) 
+					$flag++;
+						
+				self::setflags($flag);			
+				}
+			
+			// for XOF output
+			
+			if ($is_xof)
+				{
+				$this->last_cv	 	= $this->cv;
+				$this->last_state 	= $this->state;
+				$this->last_chunk 	= $chunk_words;
+				$this->last_size 	= $size;
+				}
+
+			self::chacha($chunk_words,$counter,$size,$this->flag,$is_xof,$block_over);
+			
+			// last_v for generating the first xof digest
+			
+			if ($is_xof)				
+				$this->last_v = $this->state;	 
+											
+			$hashes[] = self::genhex($this->state);
+			
+			$counter++;			
+			} 			
+		
+		return implode($hashes);			
+		}
+		
+	function XOF_output($hash, $XOF_digest_length)
+		{
+		// Output bytes. By default 32
+
+		$cycles 	= ceil($XOF_digest_length/self::HEX_BLOCK_SIZE);			
+		$XofHash	= $hash;			
+		$XofHash       .= self::genhex($this->last_v,8,16); 
+		
+		for ($k=1;$k<$cycles;$k++)
+			{
+			$this->cv 	= $this->last_cv;		
+			$this->state	= $this->last_state;
+			self::chacha($this->last_chunk,$k,$this->last_size,$this->flag,true);				 
+			$XofHash       .= self::genhex($this->state,0,16); 			
+			}
+  		
+		// final xof bytes 
+		
+		$last_bytes = self::HEX_BLOCK_SIZE-($XOF_digest_length % self::HEX_BLOCK_SIZE);
+		
+		if ($last_bytes!=self::HEX_BLOCK_SIZE) 		 
+			$XofHash = substr($XofHash,0,-$last_bytes);		
+		
+		return $XofHash;		
+		}		
+	
+	function hash($block, $XOF_digest_length = 32)
+		{
+		if (strlen($block) <= self::CHUNK_SIZE) 
+			$is_root = true;
+		else    $is_root = false;
+		
+		$is_chunk   = true;
+		$is_tree    = false;
+		$is_xof     = true;
+		$block_over = !$is_root;
+		
+		$tree = str_split(self::nodebytes($block, $is_root, $is_chunk, $is_tree, $is_xof, $block_over),self::HEX_BLOCK_SIZE);	
+		/*
+		This is the reverse tree. It makes a reduction from left to right in pairs
+		
+		First it computes all the hashes from input data, then make the tree reduction of hashes
+		till there is only one pair
+		
+		If there is an odd number of hashes, it pass the last hash without processing it 
+		till there is a parent		
+		*/									
+		$is_chunk = false;
+		$is_tree  = true;
+		$is_root  = false;
+				
+		while (sizeof($tree)>1)
+			{
+			$chaining = "";
+			foreach ($tree as $pair)
+			        {						
+				if (strlen($pair) < self::HEX_BLOCK_SIZE) 					
+					$chaining.= $pair;					
+				else    $chaining.= self::nodebytes(pack("H*",$pair), $is_root, $is_chunk, $is_tree); 
+				}						
+			$tree = str_split($chaining,self::HEX_BLOCK_SIZE);
+			}
+		
+		$is_chunk = true;
+		$is_root  = true;
+		
+		if (strlen($tree[0]) > self::BLOCK_SIZE)
+			$hash = self::nodebytes(pack("H*",$tree[0]), $is_root, $is_chunk, $is_tree, $is_xof);			
+		else    $hash = $tree[0];
+
+		return self::XOF_output($hash,$XOF_digest_length*2);
+		}
+	}
+		
+function test_blake3()
+	{	
+	// official
+	
+	$xof_length = 131;
+	
+	$vectors = file_get_contents("http://raw.githubusercontent.com/BLAKE3-team/BLAKE3/master/test_vectors/test_vectors.json");
+	$vectors = array_slice(explode('"input_len"',$vectors),1);
+	foreach ($vectors as $vector)
+		{		
+		$len    	= trim(explode(',',explode(':',$vector)[1])[0]);		
+		$rhash 		= trim(explode('"',explode('hash":',$vector)[1])[1]);
+		$rkeyed_hash 	= trim(explode('"',explode('"keyed_hash": "',$vector)[1])[0]);
+		$rderive_key 	= trim(explode('"',explode('"derive_key": "',$vector)[1])[0]);
+		
+		echo $len." ";
+		
+		$h="";
+		for ($g=0;$g<$len;$g++) 			
+			$h.=pack("c",$g % 251);
+
+		$b2 = new BLAKE3();		
+		$hash = $b2->hash($h,$xof_length);
+		
+		echo "hash ";
+		if ($hash != $rhash) die("bad hash \n $hash \n $rhash");
+						
+		$b2 = new BLAKE3("whats the Elvish word for friend");		
+		$keyed_hash = $b2->hash($h,$xof_length);
+
+		echo "keyed_hash ";
+		if ($keyed_hash != $rkeyed_hash) die("bad keyed_hash");	
+
+		$b2 = new BLAKE3();		
+		$derive_key = $b2->derivekey($h,"BLAKE3 2019-12-27 16:29:52 test vectors context",$xof_length);
+		
+		echo "derive_key ";
+		if ($derive_key != $rderive_key) die("bad derive_key");
+		
+		echo " Ok\n";
+		}
+	echo "test_blake3 Ok\n";
+	}
+	
+function big_test($count=1000000)
+	{
+	/*
+	Bytes generated like generate_vectors.py, from https://github.com/oconnor663/bao/tree/master/tests
+	
+	Check this performance against the python script https://github.com/oconnor663/bao/blob/master/tests/test_bao.py
+	
+	with 
+	
+	import datetime
+
+	a = datetime.datetime.now()	
+	input_bytes = generate_input.input_bytes(1000000)		
+	computed_hash = bao_hash(input_bytes)
+	b = datetime.datetime.now()
+	delta = b - a
+	print(delta)
+	print(computed_hash)	
+	*/
+	ini_set('precision', 8);
+	
+	$exp      = floor(log($count, 1024)) | 0;
+    	$unit     = array('B', 'KB', 'MB', 'GB', 'TB');   
+    	$size     = round($count / (pow(1024, $exp)), 2);$size.=$unit[$exp];
+	
+	echo "Big_test of $size\n";		
+	$t = microtime(true);
+	$b = "";
+	$i = 1;
+	while ($count > 0)
+		{
+		$ibytes = pack("V*",$i);
+		$take   = min(4, $count);
+		$b     .= substr($ibytes,0,$take); 
+		$count -= $take;
+		$i     += 1;
+		}
+	$b2 = new BLAKE3();		
+	$hash = $b2->hash($b);
+	echo $hash."\n";
+	echo round(microtime(true)-$t,8)." s";
+	}
+
+test_blake3();	
+big_test();
+
+
+
+
