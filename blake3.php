@@ -96,37 +96,30 @@ class BLAKE3
 			$key .= str_repeat("\x0",self::BLOCK_SIZE-strlen($key));
 									
 			$key  = array_values(unpack(self::PACKING,$key));
-			for ($i=0;$i<8;$i++)
-				$this->cv[$i]     = $key[$i];
+			$this->cv      = $key;
 			$this->flagkey = true;					
 			}
-		else 
-			for ($i=0;$i<8;$i++)
-				$this->cv[$i]     = self::IV[$i];		
+		else    $this->cv      = self::IV;		
 		}
 		
 	function derivekey($context_key="",$context="",$xof_length)
 		{		
-		for ($k=0;$k<8;$k++) 
-			  $this->state[$k] = self::IV[$k];
+		$this->state     = self::IV;
 		
 		$size		 = strlen($context);	
 		if ($size<self::BLOCK_SIZE)										
 			$context.= str_repeat("\0",self::BLOCK_SIZE-$size);
 
 		$context_words = array_values(unpack(self::PACKING,$context));								
-		self::chacha($context_words,0,$size,43);	
-
-		for ($i=0;$i<8;$i++)
-			$this->cv[$i] = $this->state[$i];
-		
+		self::chacha($context_words,0,$size,43);
+			
+		$this->cv = array_slice($this->state,0,8);		
 		$this->derive_key_material = true;
-		
+				
 		$derive_key       = self::hash($context_key,$xof_length);		
-		$derive_key_words = array_values(unpack(self::PACKING,$derive_key));			
-
-		for ($i=0;$i<8;$i++)
-			$this->cv[$i] = $derive_key_words[$i];				
+		$derive_key_words = array_values(unpack(self::PACKING,$derive_key));
+					
+		$this->cv 	  = $derive_key_words;				
 				
 		return $derive_key;		
 		}
@@ -195,8 +188,7 @@ class BLAKE3
 			for ($i=0;$i<8;$i++)				 
 				 $v[$i+8] ^= $this->cv[$i];			 				 
 			if (!$block_over)
-				for ($i=0;$i<8;$i++)				 				 
-					$this->cv[$i] = $v[$i];	
+				$this->cv  = array_slice($v,0,8);	
 			}
 			
 		$this->state = $v;				
@@ -218,11 +210,8 @@ class BLAKE3
 
 	function nodetree($block, $is_xof = false)
 		{   	 	
-		$size    	 = self::BLOCK_SIZE;
-										 					
-		for ($k=0;$k<8;$k++) 
-			$this->state[$k] = $this->cv[$k];	
-		
+		$size    	 = self::BLOCK_SIZE;							 					
+		$this->state     = $this->cv;			
 		$chunk_words     = array_values(unpack(self::PACKING,$block));
 						
 		// for XOF output
@@ -253,8 +242,7 @@ class BLAKE3
 					 				
 		foreach ($chunks as $chunk)
 			{	
-			for ($k=0;$k<8;$k++) 
-				$this->state[$k] = $this->cv[$k];	
+			$this->state = $this->cv;	
 			
 			if (strlen($chunk) > self::BLOCK_SIZE)
 				{
@@ -333,14 +321,14 @@ class BLAKE3
 
 		$cycles 	= ceil($XOF_digest_length/self::BLOCK_SIZE);			
 		$XofHash	= $hash;			
-		$XofHash       .= pack(self::PACKING,...array_slice($this->last_v,8,16));
+		$XofHash       .= pack(self::PACKING,...array_slice($this->last_v,8));
 		
 		for ($k=1;$k<$cycles;$k++)
 			{
 			$this->cv 	= $this->last_cv;		
 			$this->state	= $this->last_state;
 			self::chacha($this->last_chunk,$k,$this->last_size,$this->flag,true);				 
-			$XofHash       .= pack(self::PACKING,...array_slice($this->state,0,16)); 			
+			$XofHash       .= pack(self::PACKING,...$this->state); 			
 			}
   		
 		// final xof bytes 
@@ -469,7 +457,7 @@ function big_test($count=1000000)
 	
 	echo "Big_test of $size\n";
 				
-	$t = microtime(true);
+	
 	$b = "";
 	$i = 1;
 	while ($count > 0)
@@ -480,7 +468,7 @@ function big_test($count=1000000)
 		$count -= $take;
 		$i     += 1;
 		}
-			
+	$t = microtime(true);		
 	$b2 = new BLAKE3();		
 	$hash = $b2->hash($b);
 	echo $hash."\n";
