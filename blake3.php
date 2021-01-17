@@ -190,23 +190,16 @@ class BLAKE3
 		for ($i=0;$i<8;$i++)			 
 			 $v[$i] ^= $v[$i+8];
 	
-		if ($is_xof)			
-			for ($i=0;$i<8;$i++)
-				 {
-				 $v[$i+8] ^= $this->cv[$i];
-				 if (!$block_over)
-				 	$this->cv[$i] = $v[$i];				 
-				 }
+		if ($is_xof)
+			{			
+			for ($i=0;$i<8;$i++)				 
+				 $v[$i+8] ^= $this->cv[$i];			 				 
+			if (!$block_over)
+				for ($i=0;$i<8;$i++)				 				 
+					$this->cv[$i] = $v[$i];	
+			}
+			
 		$this->state = $v;				
-		}
-		
-	function genhex($v, $begin = 0, $end = 8)
-		{
-		$z="";
-		for ($k=$begin;$k<$end;$k++)
-			$z .= pack(self::PACKING,$v[$k]);
-							
-		return bin2hex($z);		
 		}
 
 	function setflags($start = self::START)
@@ -222,28 +215,56 @@ class BLAKE3
 		if ($this->derive_key_material)
 			$this->flag   |= self::DERIVE_KEY_MATERIAL;					
 		}
-							        
-	function nodebytes($block, $is_root = false, $is_chunk = true, $is_tree = false, $is_xof = false, $block_over=false)
+
+	function nodetree($block, $is_xof = false)
+		{   	 	
+		$size    	 = self::BLOCK_SIZE;
+										 					
+		for ($k=0;$k<8;$k++) 
+			$this->state[$k] = $this->cv[$k];	
+		
+		$chunk_words     = array_values(unpack(self::PACKING,$block));
+						
+		// for XOF output
+		
+		if ($is_xof)
+			{
+			$this->last_cv	 	= $this->cv;
+			$this->last_state 	= $this->state;
+			$this->last_chunk 	= $chunk_words;
+			$this->last_size 	= $size;
+			}
+
+		self::chacha($chunk_words,0,$size,$this->flag,$is_xof);			
+						
+		// last_v for generating the first xof digest
+		
+		if ($is_xof)	
+			$this->last_v = $this->state;			
+		
+		return pack(self::PACKING,...array_slice($this->state,0,8));			
+		}
+									        
+	function nodebytes($block, $is_root = false)
 		{  
-		$hashes 	= [];  	
+		$hashes 	= "";  	
 		$counter	= 0; 	
 		$chunks 	= str_split($block,self::CHUNK_SIZE);
-							 				
+					 				
 		foreach ($chunks as $chunk)
 			{	
 			for ($k=0;$k<8;$k++) 
 				$this->state[$k] = $this->cv[$k];	
-									 			
-			$is_last = true;
-			$size    = self::BLOCK_SIZE;
 			
 			if (strlen($chunk) > self::BLOCK_SIZE)
-				{			
+				{
+				$size    = self::BLOCK_SIZE;
+							
 				if (strlen($chunk) < self::CHUNK_SIZE) 
 					{									
 					$size = strlen($chunk) % self::BLOCK_SIZE;
 	
-					if ($size == 0) 
+					if (!$size) 
 						$size = self::BLOCK_SIZE;		
 							        
 					$npad	 = ceil(strlen($chunk)/self::BLOCK_SIZE) * self::BLOCK_SIZE;
@@ -253,11 +274,11 @@ class BLAKE3
 				$chunk_words = array_chunk(array_values(unpack(self::PACKING,$chunk)),16);
 				
 				self::setflags(self::CHUNK_START);				
-				self::chacha($chunk_words[0],$counter,self::BLOCK_SIZE,$this->flag,$is_xof,$block_over);	
+				self::chacha($chunk_words[0],$counter,self::BLOCK_SIZE,$this->flag, true, !$is_root);	
 				self::setflags(0);
 					
 				for ($k=1;$k<sizeof($chunk_words)-1;$k++)								
-					self::chacha($chunk_words[$k],$counter,self::BLOCK_SIZE,$this->flag,$is_xof,$block_over);	
+					self::chacha($chunk_words[$k],$counter,self::BLOCK_SIZE,$this->flag, true, !$is_root);	
 											
 				if ($is_root) 
 					 {
@@ -274,71 +295,62 @@ class BLAKE3
 				$chunk  	.= str_repeat("\x0",self::BLOCK_SIZE-strlen($chunk));
 				$chunk_words     = array_values(unpack(self::PACKING,$chunk));
 								
-				if ($is_chunk)
-					$flag    = self::CHUNK_START | self::CHUNK_END;			
-				else    $flag    = self::PARENT;
-				
+				$flag    = self::CHUNK_START | self::CHUNK_END;			
+								
 				if ($is_root)
 					{
 					$flag   |= self::ROOT;
 					$counter = 0;
 					}
-				
-				if ($is_tree and $is_root) 
-					$flag++;
 						
 				self::setflags($flag);			
 				}
 			
 			// for XOF output
-			
-			if ($is_xof)
-				{
-				$this->last_cv	 	= $this->cv;
-				$this->last_state 	= $this->state;
-				$this->last_chunk 	= $chunk_words;
-				$this->last_size 	= $size;
-				}
-
-			self::chacha($chunk_words,$counter,$size,$this->flag,$is_xof,$block_over);
-			
-			// last_v for generating the first xof digest
-			
-			if ($is_xof)				
-				$this->last_v = $this->state;	 
+									
+			$this->last_cv	 	= $this->cv;
+			$this->last_state 	= $this->state;
+				
+			self::chacha($chunk_words,$counter,$size,$this->flag, true, !$is_root);
 											
-			$hashes[] = self::genhex($this->state);
+			$hashes .= pack(self::PACKING,...array_slice($this->state,0,8));
 			
 			$counter++;			
-			} 			
+			} 
+						
+		// last_v for generating the first xof digest
 		
-		return implode($hashes);			
+		$this->last_chunk 	= $chunk_words;
+		$this->last_size 	= $size;								
+		$this->last_v 		= $this->state;	
+					
+		return $hashes;			
 		}
 		
 	function XOF_output($hash, $XOF_digest_length)
 		{
 		// Output bytes. By default 32
 
-		$cycles 	= ceil($XOF_digest_length/self::HEX_BLOCK_SIZE);			
+		$cycles 	= ceil($XOF_digest_length/self::BLOCK_SIZE);			
 		$XofHash	= $hash;			
-		$XofHash       .= self::genhex($this->last_v,8,16); 
+		$XofHash       .= pack(self::PACKING,...array_slice($this->last_v,8,16));
 		
 		for ($k=1;$k<$cycles;$k++)
 			{
 			$this->cv 	= $this->last_cv;		
 			$this->state	= $this->last_state;
 			self::chacha($this->last_chunk,$k,$this->last_size,$this->flag,true);				 
-			$XofHash       .= self::genhex($this->state,0,16); 			
+			$XofHash       .= pack(self::PACKING,...array_slice($this->state,0,16)); 			
 			}
   		
 		// final xof bytes 
 		
-		$last_bytes = self::HEX_BLOCK_SIZE-($XOF_digest_length % self::HEX_BLOCK_SIZE);
+		$last_bytes = self::BLOCK_SIZE-($XOF_digest_length % self::BLOCK_SIZE);
 		
-		if ($last_bytes!=self::HEX_BLOCK_SIZE) 		 
+		if ($last_bytes!=self::BLOCK_SIZE) 		 
 			$XofHash = substr($XofHash,0,-$last_bytes);		
 		
-		return $XofHash;		
+		return bin2hex($XofHash);		
 		}		
 	
 	function hash($block, $XOF_digest_length = 32)
@@ -347,12 +359,7 @@ class BLAKE3
 			$is_root = true;
 		else    $is_root = false;
 		
-		$is_chunk   = true;
-		$is_tree    = false;
-		$is_xof     = true;
-		$block_over = !$is_root;
-		
-		$tree = str_split(self::nodebytes($block, $is_root, $is_chunk, $is_tree, $is_xof, $block_over),self::HEX_BLOCK_SIZE);	
+		$tree = str_split(self::nodebytes($block, $is_root),self::BLOCK_SIZE);	
 		/*
 		This is the reverse tree. It makes a reduction from left to right in pairs
 		
@@ -361,31 +368,33 @@ class BLAKE3
 		
 		If there is an odd number of hashes, it pass the last hash without processing it 
 		till there is a parent		
-		*/									
-		$is_chunk = false;
-		$is_tree  = true;
-		$is_root  = false;
-				
-		while (sizeof($tree)>1)
+		*/
+		if (sizeof($tree)>1) 			
 			{
-			$chaining = "";
-			foreach ($tree as $pair)
-			        {						
-				if (strlen($pair) < self::HEX_BLOCK_SIZE) 					
-					$chaining.= $pair;					
-				else    $chaining.= self::nodebytes(pack("H*",$pair), $is_root, $is_chunk, $is_tree); 
-				}						
-			$tree = str_split($chaining,self::HEX_BLOCK_SIZE);
+			self::setflags(self::PARENT);
+					
+			while (sizeof($tree)>1)
+				{
+				$chaining = "";			
+				foreach ($tree as $pair)
+				        {						
+					if (strlen($pair) < self::BLOCK_SIZE) 					
+						$chaining.= $pair;					
+					else    $chaining.= self::nodetree($pair); 
+					}						
+				$tree = str_split(($chaining),self::BLOCK_SIZE);
+				}
 			}
-		
-		$is_chunk = true;
-		$is_root  = true;
-		
-		if (strlen($tree[0]) > self::BLOCK_SIZE)
-			$hash = self::nodebytes(pack("H*",$tree[0]), $is_root, $is_chunk, $is_tree, $is_xof);			
+			
+		if (strlen($tree[0]) > self::BLOCK_SIZE/2)
+			{
+			$flag    = self::CHUNK_START | self::CHUNK_END | self::ROOT;	
+			self::setflags(++$flag);			
+			$hash = self::nodetree($tree[0], $is_xof = true);
+			}			
 		else    $hash = $tree[0];
-
-		return self::XOF_output($hash,$XOF_digest_length*2);
+		
+		return self::XOF_output($hash,$XOF_digest_length);
 		}
 	}
 		
@@ -458,7 +467,8 @@ function big_test($count=1000000)
     	$unit     = array('B', 'KB', 'MB', 'GB', 'TB');   
     	$size     = round($count / (pow(1024, $exp)), 2);$size.=$unit[$exp];
 	
-	echo "Big_test of $size\n";		
+	echo "Big_test of $size\n";
+				
 	$t = microtime(true);
 	$b = "";
 	$i = 1;
@@ -470,15 +480,12 @@ function big_test($count=1000000)
 		$count -= $take;
 		$i     += 1;
 		}
+			
 	$b2 = new BLAKE3();		
 	$hash = $b2->hash($b);
 	echo $hash."\n";
-	echo round(microtime(true)-$t,8)." s";
+	echo round(microtime(true)-$t,8)." s\n";	
 	}
 
 test_blake3();	
 big_test();
-
-
-
-
