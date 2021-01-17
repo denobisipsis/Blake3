@@ -370,7 +370,7 @@ class BLAKE3
 						$chaining.= $pair;					
 					else    $chaining.= self::nodetree($pair); 
 					}						
-				$tree = str_split(($chaining),self::BLOCK_SIZE);
+				$tree = str_split($chaining,self::BLOCK_SIZE);
 				}
 			}
 			
@@ -457,7 +457,7 @@ function big_test($count=1000000)
 	
 	echo "Big_test of $size\n";
 				
-	
+	$t = microtime(true);
 	$b = "";
 	$i = 1;
 	while ($count > 0)
@@ -468,7 +468,7 @@ function big_test($count=1000000)
 		$count -= $take;
 		$i     += 1;
 		}
-	$t = microtime(true);		
+			
 	$b2 = new BLAKE3();		
 	$hash = $b2->hash($b);
 	echo $hash."\n";
