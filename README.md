@@ -8,10 +8,6 @@ https://github.com/BLAKE3-team/BLAKE3
 
 It supports HASH, KEYED and DERIVE modes with XOF output
 
-There is a python version https://github.com/oconnor663/bao
-
-which is 2.5x slower than this implementation in generating the hash
-
 This implementation have been checked with the test vectors provided
 
 https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/master/test_vectors/test_vectors.json
